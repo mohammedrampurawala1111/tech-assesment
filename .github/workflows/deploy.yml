@@ -17,15 +17,8 @@ on:
       - 'deploy.config'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
-    inputs:
-      deployment_strategy:
-        description: 'Deployment strategy (canary or rolling)'
-        required: true
-        default: 'canary'
-        type: choice
-        options:
-          - canary
-          - rolling
+    # Note: Deployment strategy is automatically determined by the script
+    # First deployment uses all-at-once, subsequent use canary from deploy.config
 
 env:
   AWS_REGION: eu-central-1
@@ -69,11 +62,6 @@ jobs:
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.5.0
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -148,16 +136,12 @@ jobs:
         with:
           terraform_version: 1.5.0
 
-      - name: Set deployment strategy
+      - name: Check deployment strategy
         id: strategy
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            STRATEGY="${{ github.event.inputs.deployment_strategy }}"
-          else
-            STRATEGY="canary"
-          fi
-          echo "strategy=$STRATEGY" >> $GITHUB_OUTPUT
-          echo "Deployment strategy: $STRATEGY"
+          echo "Deployment script will automatically detect first deployment"
+          echo "First deployment: Uses all-at-once (immediate, no canary)"
+          echo "Subsequent deployments: Uses canary strategy from deploy.config"
 
       - name: Get Terraform outputs
         id: terraform-outputs
@@ -263,20 +247,37 @@ jobs:
             fi
           fi
           
-          echo "Waiting for CodeDeploy canary deployment to complete..."
+          # Check deployment config to determine wait time
+          DEPLOYMENT_CONFIG=$(aws deploy get-deployment \
+            --deployment-id "$DEPLOYMENT_ID" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'deploymentInfo.deploymentConfigName' \
+            --output text 2>/dev/null || echo "UNKNOWN")
+          
+          echo "Waiting for CodeDeploy deployment to complete..."
           echo "Deployment ID: $DEPLOYMENT_ID"
-          echo "Traffic shifting: 10% every 1 minute (monitored by CloudWatch alarm)"
-          echo "This may take 10+ minutes for full canary deployment"
+          echo "Deployment Config: $DEPLOYMENT_CONFIG"
+          
+          if [[ "$DEPLOYMENT_CONFIG" == *"AllAtOnce"* ]]; then
+            echo "Strategy: All-at-once (first deployment - immediate, no canary)"
+            echo "This should complete quickly (typically 2-5 minutes)"
+            MAX_ITERATIONS=60  # 10 minutes max for all-at-once
+          else
+            echo "Strategy: Canary (subsequent deployment - traffic shifting)"
+            echo "Traffic shifting: 10% every 1 minute (monitored by CloudWatch alarm)"
+            echo "This may take 10+ minutes for full canary deployment"
+            MAX_ITERATIONS=120  # 20 minutes max for canary
+          fi
           
           # Poll deployment status with detailed output
-          for i in {1..120}; do
+          for i in $(seq 1 $MAX_ITERATIONS); do
             STATUS=$(aws deploy get-deployment \
               --deployment-id "$DEPLOYMENT_ID" \
               --region ${{ env.AWS_REGION }} \
               --query 'deploymentInfo.status' \
               --output text 2>/dev/null || echo "UNKNOWN")
             
-            echo "[$i/120] Deployment status: $STATUS"
+            echo "[$i/$MAX_ITERATIONS] Deployment status: $STATUS"
             
             if [ "$STATUS" = "Succeeded" ]; then
               echo "✓ Deployment completed successfully!"
@@ -308,25 +309,18 @@ jobs:
             exit 1
           fi
           
-          # Verify service is using new task definition
+          # Verify deployment completed successfully
           echo ""
-          echo "Verifying service task definition..."
-          CURRENT_TD=$(aws ecs describe-services \
-            --cluster "$CLUSTER_NAME" \
-            --services "$SERVICE_NAME" \
+          echo "✓ Deployment completed successfully!"
+          
+          # Show deployment summary
+          echo ""
+          echo "Deployment Summary:"
+          aws deploy get-deployment \
+            --deployment-id "$DEPLOYMENT_ID" \
             --region ${{ env.AWS_REGION }} \
-            --query 'services[0].taskDefinition' \
-            --output text)
-          
-          echo "Service is using: $CURRENT_TD"
-          echo "Expected: ${{ steps.task-def.outputs.task_definition_arn }}"
-          
-          if [[ "$CURRENT_TD" == *"${{ steps.task-def.outputs.task_definition_arn }}"* ]]; then
-            echo "✓ Service is using the new task definition"
-          else
-            echo "⚠ Warning: Service task definition may not match expected"
-            echo "This can happen if CodeDeploy is still in progress or if there are multiple deployments"
-          fi
+            --query '{Status:deploymentInfo.status,Config:deploymentInfo.deploymentConfigName,CreateTime:deploymentInfo.createTime,CompleteTime:deploymentInfo.completeTime}' \
+            --output table
 
       - name: Verify deployment
         run: |
