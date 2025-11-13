@@ -74,7 +74,7 @@ jobs:
         run: terraform init -input=false
 
       - name: Terraform Validate
-        run: terraform validate -no-color
+        run: terraform validate -no-color -var-file=terraform.tfvars
 
       - name: Terraform Security Scan
         uses: bridgecrewio/checkov-action@master
@@ -114,8 +114,39 @@ jobs:
         run: terraform init -input=false
 
       - name: Terraform Plan
-        run: terraform plan -out=tfplan -no-color -input=false
+        run: terraform plan -out=tfplan -no-color -input=false -var-file=terraform.tfvars
         continue-on-error: false
+
+      - name: Install OPA and jq
+        run: |
+          # Install jq if not already available
+          sudo apt-get update && sudo apt-get install -y jq || true
+          
+          # Install OPA
+          curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64
+          chmod +x opa
+          sudo mv opa /usr/local/bin/
+
+      - name: Check for destroy operations with OPA
+        run: |
+          echo "Converting Terraform plan to JSON..."
+          terraform show -json tfplan > tfplan.json
+          
+          echo "Running OPA policy check for resource destruction..."
+          OPA_OUTPUT=$(opa eval --format json --data opa-policy.rego --input tfplan.json "data.terraform.plan.deny")
+          DENY_ARRAY=$(echo "$OPA_OUTPUT" | jq -r '.result[0].expressions[0].value // []')
+          DENY_COUNT=$(echo "$DENY_ARRAY" | jq -r 'length')
+          
+          if [ "$DENY_COUNT" = "0" ] || [ -z "$DENY_COUNT" ]; then
+            echo "✅ No resource destruction detected - OPA check passed"
+          else
+            echo "::error::❌ OPA Policy Violation: Resource destruction detected in plan!"
+            echo ""
+            echo "The following $DENY_COUNT resource(s) will be destroyed:"
+            opa eval --format pretty --data opa-policy.rego --input tfplan.json "data.terraform.plan.deny"
+            echo ""
+            exit 1
+          fi
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
