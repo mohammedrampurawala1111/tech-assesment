@@ -1,0 +1,171 @@
+name: Terraform Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infrastructure/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'infrastructure/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-central-1
+  TF_VERSION: 1.5.0
+  AWS_ROLE_ARN: arn:aws:iam::745039059228:role/surepay-github-oidc-role
+
+jobs:
+  terraform-validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: ./infrastructure
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Debug OIDC token claims
+        id: oidc-debug
+        run: |
+          set -euo pipefail
+          RESPONSE=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          ID_TOKEN=$(echo "$RESPONSE" | jq -r '.value')
+          PAYLOAD=$(echo "$ID_TOKEN" | cut -d '.' -f2)
+          # Normalize padding before decoding
+          PADDING=$((4 - ${#PAYLOAD} % 4))
+          if [ $PADDING -lt 4 ]; then
+            PAYLOAD="${PAYLOAD}$(printf '=%.0s' $(seq 1 $PADDING))"
+          fi
+          echo "$PAYLOAD" | base64 --decode > payload.json
+          echo "OIDC token subject: $(jq -r '.sub' payload.json)"
+          echo "OIDC token audience: $(jq -r '.aud' payload.json)"
+          echo "Full token payload:"
+          cat payload.json | jq .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: |
+          if ! terraform fmt -check -diff; then
+            echo "::error::Terraform files are not properly formatted. Run 'terraform fmt' to fix."
+            terraform fmt -diff
+            exit 1
+          fi
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Security Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ./infrastructure
+          framework: terraform
+          soft_fail: true
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+    if: github.event_name != 'pull_request'
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: ./infrastructure
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan -no-color -input=false
+        continue-on-error: false
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: infrastructure/tfplan
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: ./infrastructure
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: infrastructure
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -no-color -input=false tfplan
+
+      - name: Output infrastructure details
+        run: |
+          echo "## Infrastructure Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "### Cluster Details" >> $GITHUB_STEP_SUMMARY
+          terraform output -json >> $GITHUB_STEP_SUMMARY
+

@@ -1,0 +1,348 @@
+name: Build and Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'application/**'
+      - 'deploy.config'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'application/**'
+      - 'deploy.config'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      deployment_strategy:
+        description: 'Deployment strategy (canary or rolling)'
+        required: true
+        default: 'canary'
+        type: choice
+        options:
+          - canary
+          - rolling
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: surepay-app
+  ECS_CLUSTER: surepay-cluster
+  ECS_SERVICE: surepay-service
+  AWS_ROLE_ARN: arn:aws:iam::745039059228:role/surepay-github-oidc-role
+
+jobs:
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Debug OIDC token claims
+        id: oidc-debug
+        run: |
+          set -euo pipefail
+          RESPONSE=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          ID_TOKEN=$(echo "$RESPONSE" | jq -r '.value')
+          PAYLOAD=$(echo "$ID_TOKEN" | cut -d '.' -f2)
+          PADDING=$((4 - ${#PAYLOAD} % 4))
+          if [ $PADDING -lt 4 ]; then
+            PAYLOAD="${PAYLOAD}$(printf '=%.0s' $(seq 1 $PADDING))"
+          fi
+          echo "$PAYLOAD" | base64 --decode > payload.json
+          echo "OIDC token subject: $(jq -r '.sub' payload.json)"
+          echo "OIDC token audience: $(jq -r '.aud' payload.json)"
+          echo "Full token payload:"
+          cat payload.json | jq .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Read image tag from deploy.config
+        id: image-tag
+        run: |
+          # Read TAG from deploy.config
+          if [[ -f deploy.config ]]; then
+            TAG=$(grep "^TAG=" deploy.config | cut -d'=' -f2 | tr -d ' ' || echo "")
+          fi
+          
+          if [[ -z "$TAG" ]]; then
+            echo "Error: TAG not found in deploy.config"
+            exit 1
+          fi
+          
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Image tag from deploy.config: ${TAG}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
+        run: |
+          cd application
+          docker buildx build --platform linux/amd64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            --push .
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Built and pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image }}
+          format: 'table'
+          exit-code: '0'
+
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Set deployment strategy
+        id: strategy
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            STRATEGY="${{ github.event.inputs.deployment_strategy }}"
+          else
+            STRATEGY="canary"
+          fi
+          echo "strategy=$STRATEGY" >> $GITHUB_OUTPUT
+          echo "Deployment strategy: $STRATEGY"
+
+      - name: Get Terraform outputs
+        id: terraform-outputs
+        run: |
+          cd infrastructure
+          terraform init
+          CLUSTER_NAME=$(terraform output -raw cluster_name)
+          SERVICE_NAME=$(terraform output -raw service_name)
+          ECR_URL=$(terraform output -raw ecr_repository_url)
+          LISTENER_ARN=$(terraform output -raw listener_arn)
+          BLUE_TG=$(terraform output -raw blue_target_group_arn)
+          GREEN_TG=$(terraform output -raw green_target_group_arn)
+          ALB_SUFFIX=$(terraform output -raw alb_arn_suffix)
+          ALARM_NAME=$(terraform output -raw alb_success_rate_alarm_name)
+          APP_NAME=$(terraform output -raw codedeploy_app_name)
+          DEPLOYMENT_GROUP=$(terraform output -raw codedeploy_deployment_group_name)
+          
+          echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+          echo "service_name=$SERVICE_NAME" >> $GITHUB_OUTPUT
+          echo "ecr_url=$ECR_URL" >> $GITHUB_OUTPUT
+          echo "listener_arn=$LISTENER_ARN" >> $GITHUB_OUTPUT
+          echo "blue_target_group_arn=$BLUE_TG" >> $GITHUB_OUTPUT
+          echo "green_target_group_arn=$GREEN_TG" >> $GITHUB_OUTPUT
+          echo "alb_arn_suffix=$ALB_SUFFIX" >> $GITHUB_OUTPUT
+          echo "alb_success_rate_alarm_name=$ALARM_NAME" >> $GITHUB_OUTPUT
+          echo "codedeploy_app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "codedeploy_deployment_group_name=$DEPLOYMENT_GROUP" >> $GITHUB_OUTPUT
+
+      - name: Read image tag from deploy.config
+        id: image-tag
+        run: |
+          # Read TAG from deploy.config to match build step
+          if [[ -f deploy.config ]]; then
+            TAG=$(grep "^TAG=" deploy.config | cut -d'=' -f2 | tr -d ' ' || echo "")
+          fi
+          
+          if [[ -z "$TAG" ]]; then
+            echo "Error: TAG not found in deploy.config"
+            exit 1
+          fi
+          
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Using image tag from deploy.config: ${TAG}"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq zip
+
+      - name: Deploy with CodeDeploy
+        id: codedeploy
+        env:
+          IMAGE_URL: ${{ steps.terraform-outputs.outputs.ecr_url }}:${{ steps.image-tag.outputs.tag }}
+        run: |
+          chmod +x scripts/deploy_codedeploy_only.sh
+          ./scripts/deploy_codedeploy_only.sh --image "$IMAGE_URL" 2>&1 | tee deploy_output.log
+          
+          # Parse deployment ID from script output (most reliable)
+          DEPLOYMENT_ID=$(grep -i "Deployment ID:" deploy_output.log | grep -oE 'd-[A-Z0-9]+' | head -1 || echo "")
+          
+          # If not found in output, wait and query AWS
+          if [[ -z "$DEPLOYMENT_ID" ]]; then
+            echo "Deployment ID not found in script output, querying AWS..."
+            sleep 5
+            DEPLOYMENT_ID=$(aws deploy list-deployments \
+              --application-name ${{ steps.terraform-outputs.outputs.codedeploy_app_name }} \
+              --deployment-group-name ${{ steps.terraform-outputs.outputs.codedeploy_deployment_group_name }} \
+              --region ${{ env.AWS_REGION }} \
+              --max-items 1 \
+              --query 'deployments[0]' \
+              --output text 2>/dev/null | grep -E '^d-[A-Z0-9]+$' || echo "")
+          fi
+          
+          # Validate deployment ID format
+          if [[ -z "$DEPLOYMENT_ID" ]] || [[ ! "$DEPLOYMENT_ID" =~ ^d-[A-Z0-9]+$ ]]; then
+            echo "Warning: Could not extract valid deployment ID. Will query for latest deployment in wait step."
+            echo "deployment_id=" >> $GITHUB_OUTPUT
+          else
+            echo "deployment_id=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
+            echo "Deployment ID: ${DEPLOYMENT_ID}"
+          fi
+
+      - name: Wait for deployment
+        env:
+          DEPLOYMENT_ID: ${{ steps.codedeploy.outputs.deployment_id }}
+          CLUSTER_NAME: ${{ steps.terraform-outputs.outputs.cluster_name }}
+          SERVICE_NAME: ${{ steps.terraform-outputs.outputs.service_name }}
+        run: |
+          # Get deployment ID if not provided
+          if [[ -z "$DEPLOYMENT_ID" ]] || [[ "$DEPLOYMENT_ID" == "None" ]]; then
+            echo "Deployment ID not found, querying for latest deployment..."
+            DEPLOYMENT_ID=$(aws deploy list-deployments \
+              --application-name ${{ steps.terraform-outputs.outputs.codedeploy_app_name }} \
+              --deployment-group-name ${{ steps.terraform-outputs.outputs.codedeploy_deployment_group_name }} \
+              --region ${{ env.AWS_REGION }} \
+              --max-items 1 \
+              --query 'deployments[0]' \
+              --output text 2>/dev/null || echo "")
+            
+            if [[ -z "$DEPLOYMENT_ID" ]] || [[ "$DEPLOYMENT_ID" == "None" ]]; then
+              echo "Error: Could not find deployment ID"
+              exit 1
+            fi
+          fi
+          
+          echo "Waiting for CodeDeploy canary deployment to complete..."
+          echo "Deployment ID: $DEPLOYMENT_ID"
+          echo "Traffic shifting: 10% every 1 minute (monitored by CloudWatch alarm)"
+          echo "This may take 10+ minutes for full canary deployment"
+          
+          # Poll deployment status with detailed output
+          for i in {1..120}; do
+            STATUS=$(aws deploy get-deployment \
+              --deployment-id "$DEPLOYMENT_ID" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'deploymentInfo.status' \
+              --output text 2>/dev/null || echo "UNKNOWN")
+            
+            echo "[$i/120] Deployment status: $STATUS"
+            
+            if [ "$STATUS" = "Succeeded" ]; then
+              echo "✓ Deployment completed successfully!"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Stopped" ]; then
+              echo "✗ Deployment failed or stopped"
+              aws deploy get-deployment \
+                --deployment-id "$DEPLOYMENT_ID" \
+                --region ${{ env.AWS_REGION }} \
+                --query '{Status:deploymentInfo.status,Message:deploymentInfo.statusMessage,Error:deploymentInfo.errorInformation}' \
+                --output table
+              
+              if [ "$STATUS" = "Stopped" ]; then
+                echo "Deployment was stopped (likely due to ALB uptime alarm < 99.99%)"
+              fi
+              exit 1
+            fi
+            
+            sleep 10
+          done
+          
+          if [ "$STATUS" != "Succeeded" ]; then
+            echo "✗ Deployment timed out or failed"
+            aws deploy get-deployment \
+              --deployment-id "$DEPLOYMENT_ID" \
+              --region ${{ env.AWS_REGION }} \
+              --query '{Status:deploymentInfo.status,Message:deploymentInfo.statusMessage}' \
+              --output table
+            exit 1
+          fi
+          
+          # Verify service is using new task definition
+          echo ""
+          echo "Verifying service task definition..."
+          CURRENT_TD=$(aws ecs describe-services \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          
+          echo "Service is using: $CURRENT_TD"
+          echo "Expected: ${{ steps.task-def.outputs.task_definition_arn }}"
+          
+          if [[ "$CURRENT_TD" == *"${{ steps.task-def.outputs.task_definition_arn }}"* ]]; then
+            echo "✓ Service is using the new task definition"
+          else
+            echo "⚠ Warning: Service task definition may not match expected"
+            echo "This can happen if CodeDeploy is still in progress or if there are multiple deployments"
+          fi
+
+      - name: Verify deployment
+        run: |
+          echo "Waiting for deployment to stabilize..."
+          sleep 30
+          aws ecs describe-services \
+            --cluster ${{ steps.terraform-outputs.outputs.cluster_name }} \
+            --services ${{ steps.terraform-outputs.outputs.service_name }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].deployments[?status==`PRIMARY`]' \
+            --output table
+
+      - name: Get ALB DNS name
+        run: |
+          cd infrastructure
+          ALB_DNS=$(terraform output -raw alb_dns_name)
+          echo "Application is available at: http://$ALB_DNS"
+          echo "::notice:: Application deployed at http://$ALB_DNS"
+
