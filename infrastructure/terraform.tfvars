@@ -14,4 +14,3 @@ container_port   = 3000
 
 enable_canary = true
 image_tag     = "latest"
-
