@@ -130,23 +130,23 @@ jobs:
       - name: Check for destroy operations with OPA
         run: |
           echo "Converting Terraform plan to JSON..."
-          # terraform show -json tfplan > tfplan.json
+          terraform show -json tfplan > tfplan.json
           
-          # echo "Running OPA policy check for resource destruction..."
-          # OPA_OUTPUT=$(opa eval --format json --data opa-policy.rego --input tfplan.json "data.terraform.plan.deny")
-          # DENY_ARRAY=$(echo "$OPA_OUTPUT" | jq -r '.result[0].expressions[0].value // []')
-          # DENY_COUNT=$(echo "$DENY_ARRAY" | jq -r 'length')
+          echo "Running OPA policy check for resource destruction..."
+          OPA_OUTPUT=$(opa eval --format json --data opa-policy.rego --input tfplan.json "data.terraform.plan.deny")
+          DENY_ARRAY=$(echo "$OPA_OUTPUT" | jq -r '.result[0].expressions[0].value // []')
+          DENY_COUNT=$(echo "$DENY_ARRAY" | jq -r 'length')
           
-          # if [ "$DENY_COUNT" = "0" ] || [ -z "$DENY_COUNT" ]; then
-          #   echo "✅ No resource destruction detected - OPA check passed"
-          # else
-          #   echo "::error::❌ OPA Policy Violation: Resource destruction detected in plan!"
-          #   echo ""
-          #   echo "The following $DENY_COUNT resource(s) will be destroyed:"
-          #   opa eval --format pretty --data opa-policy.rego --input tfplan.json "data.terraform.plan.deny"
-          #   echo ""
-          #   exit 1
-          # fi
+          if [ "$DENY_COUNT" = "0" ] || [ -z "$DENY_COUNT" ]; then
+            echo "✅ No resource destruction detected - OPA check passed"
+          else
+            echo "::error::❌ OPA Policy Violation: Resource destruction detected in plan!"
+            echo ""
+            echo "The following $DENY_COUNT resource(s) will be destroyed:"
+            opa eval --format pretty --data opa-policy.rego --input tfplan.json "data.terraform.plan.deny"
+            echo ""
+            exit 1
+          fi
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
