@@ -70,8 +70,8 @@ jq --version
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/Privet-mir/surepay-assesment.git
-cd surepay-assesment
+git clone https://github.com/mohammedrampurawala1111/tech-assesment.git
+cd tech-assesment
 ```
 
 ### 2. Configure AWS Credentials
