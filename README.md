@@ -367,7 +367,7 @@ Type `yes` when prompted. This will remove:
 ├── scripts/                        # Deployment scripts
 │   ├── init.sh                     # AWS setup script (OIDC, IAM, S3)
 │   ├── deploy_codedeploy_only.sh   # CodeDeploy deployment script
-│   └── deploy_ecs.sh               # ECS native deployment (alternative)
+│   └── init.sh                     # add oidc and iam role for github
 ├── .github/workflows/              # CI/CD pipelines
 │   ├── deploy.yml                  # Application deployment workflow
 │   └── terraform.yml               # Infrastructure workflow
